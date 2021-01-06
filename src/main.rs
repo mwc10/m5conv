@@ -1,0 +1,360 @@
+use anyhow::{self, bail, Context};
+use encoding_rs::MACINTOSH;
+use encoding_rs_io::DecodeReaderBytesBuilder;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::{env, str::FromStr};
+
+mod m5;
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{:?}", e);
+        ::std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let mut args = env::args().skip(1);
+    let input = args.next();
+    let output = args.next();
+
+    match input.as_deref() {
+        Some("-h") | Some("--help") => {
+            print_usage();
+            return Ok(());
+        }
+        None => {
+            eprintln!("Missing input M5 tab-delimited file");
+            eprintln!("Pass file path or --help for more info");
+            return Ok(());
+        }
+        Some(_) => (),
+    }
+
+    let input = PathBuf::from(input.unwrap());
+    let output = match output {
+        Some(p) => {
+            let f = File::create(PathBuf::from(p)).context("creating output file")?;
+            Box::new(BufWriter::new(f)) as Box<dyn Write>
+        }
+        None => Box::new(io::stdout()) as Box<dyn Write>,
+    };
+
+    parse_input(input, output)
+
+    //println!("{:?}", data);
+
+    //Ok(())
+}
+
+fn print_usage() {
+    println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+    println!("Convert Softmax M5(e) tab-delimited to flat CSV by well");
+    println!();
+    println!("Usage:");
+    println!("  {} <input> [output]", env!("CARGO_BIN_NAME"));
+    println!();
+    println!("  input           path to M5 tsv file");
+    println!("  [output]        path to output, or stdout if not present");
+}
+
+#[derive(Debug)]
+struct M5Data {
+    blocks: u16,
+}
+
+fn write_data(data: Vec<WellValue>, wtr: Box<dyn Write>) -> anyhow::Result<()> {
+    let mut wtr = csv::Writer::from_writer(wtr);
+    let header = [
+        "Plate",
+        "Well",
+        "Row",
+        "Col",
+        "Time [hr]",
+        "Temperature [C]",
+        "Read Mode",
+        "Wavelength",
+        "Value",
+    ];
+    wtr.write_record(&header)
+        .context("writing output CSV header")?;
+
+    for well in data {
+        wtr.write_field(well.plate)?;
+        let row_char = (b'A' + well.well.0) as char;
+        wtr.write_field(format!("{}{:02}", row_char, well.well.1 + 1))?;
+        wtr.write_field(&[row_char as u8])?;
+        wtr.write_field(format!("{}", well.well.1))?;
+        wtr.write_field(format!("{}", well.time))?;
+        wtr.write_field(format!("{}", well.temp))?;
+        match well.wavelength {
+            Wavelength::Fluorescence(ex, em) => {
+                wtr.write_field("Fluorescence")?;
+                wtr.write_field(format!("ex {}/em {}", ex, em))?;
+            }
+            _ => {
+                bail!("unsupported wavelength for output: {:?}", well.wavelength);
+            }
+        }
+        wtr.write_field(format!("{}", well.value))?;
+        wtr.write_record(None::<&[u8]>)?;
+    }
+
+    Ok(())
+}
+
+fn parse_input<'a>(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> {
+    // output text file seems to be in macroman encoding..? Just for the degree symbol...
+    let decoder = DecodeReaderBytesBuilder::new()
+        .encoding(Some(MACINTOSH))
+        .build(File::open(path)?);
+    let mut rdr = BufReader::new(decoder);
+    let mut buf = String::with_capacity(0x100);
+
+    rdr.read_line(&mut buf).context("reading block count")?;
+    let block_count = m5::M5DataBlocks::from_str(&buf).context("parsing initial blocks count")?;
+    //println!("{:?}", block_count);
+    buf.clear();
+
+    // loop for multiple blocks here?
+    rdr.read_line(&mut buf).context("reading plate info")?;
+    let settings = parse_settings(&buf).context("parsing plate info")?;
+    //println!("{:#?}", settings);
+    buf.clear();
+
+    rdr.read_line(&mut buf)
+        .context("reading temp. and plate col header line")?;
+    match buf.split('\t').nth(1) {
+        Some("Temperature(°C)") => (),
+        Some(unk) => bail!("Unknown/unsupported temperature unit: {}", unk),
+        None => bail!("Couldn't read temperature and plate headers:\n{}", &buf),
+    }
+    buf.clear();
+
+    let plate_data = parse_plate(&mut rdr, &mut buf, &settings)?;
+
+    write_data(plate_data, output).context("writing output CSV")
+}
+
+fn parse_plate<'p, R: BufRead>(
+    mut rdr: R,
+    buf: &mut String,
+    settings: &'p PlateSettings,
+) -> anyhow::Result<Vec<WellValue<'p>>> {
+    let total_wells =
+        settings.wavelengths.len() * (settings.cols as usize) * (settings.rows as usize);
+    let mut output = Vec::with_capacity(total_wells);
+    //let mut plate_buf = Vec::with_capacity(plate_cols);
+
+    let mut time = None;
+    let mut temp = None;
+
+    // loop for multiple time points here?
+    for r in 0..settings.rows {
+        //plate_buf.clear();
+        buf.clear();
+        rdr.read_line(buf)?;
+
+        let mut line = buf.split('\t');
+        let new_time = line
+            .next()
+            .ok_or(anyhow::anyhow!("no time column"))
+            .and_then(get_time)
+            .context(format!("couldn't parse time, {}", &buf))?;
+        let new_temp = line
+            .next()
+            .ok_or(anyhow::anyhow!("no temp column"))
+            .and_then(get_temp)
+            .context("couldn't parse temperaute")?;
+
+        time = time.or(new_time);
+        temp = temp.or(new_temp);
+
+        // borrow checker
+        let plate_buf: Vec<_> = line.collect();
+        //let plate_iter =
+
+        plate_buf
+            .chunks(settings.cols as usize + 1)
+            .zip(settings.wavelengths.iter().copied())
+            .flat_map(|(plate, wavelength)| {
+                let (plate, spacer) = plate.split_at(settings.cols as usize);
+
+                plate
+                    .iter()
+                    .copied()
+                    .map(str::trim)
+                    .enumerate()
+                    .filter(|(_, s)| !s.is_empty())
+                    .map(move |(c, value)| {
+                        value
+                            .parse()
+                            .context("parsing well value")
+                            .map(|value| WellValue {
+                                plate: &settings.name,
+                                temp: temp.expect("temp value before wells"),
+                                time: time.expect("time value before wells"),
+                                wavelength,
+                                well: (r, c as u8),
+                                value,
+                            })
+                    })
+            })
+            .try_for_each::<_, anyhow::Result<()>>(|val| {
+                let val = val.context("issue parsing well value")?;
+
+                output.push(val);
+
+                Ok(())
+            })?;
+    }
+
+    buf.clear();
+    rdr.read_line(buf)?;
+    // check that this line is empty
+    //println!("empty line?\n'{}'", &buf);
+
+    //println!("Time: {:?}hr and Temp: {:?}C", time, temp)
+
+    //line.next().ok_or(anyhow::anyhow!("missing spacer column")).and_then(check_spacer)?;
+
+    Ok(output)
+}
+
+fn check_spacer(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("non-empty spacer column: {}", s))
+    }
+}
+
+fn get_temp(s: &str) -> anyhow::Result<Option<f64>> {
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Some(s.parse().map_err(Into::into)).transpose()
+    }
+}
+
+fn get_time(s: &str) -> anyhow::Result<Option<f64>> {
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Some(parse_time(s)).transpose()
+    }
+}
+
+fn parse_time(s: &str) -> anyhow::Result<f64> {
+    let mut it = s.splitn(2, ':');
+    let h: f64 = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No hours in time: {}, s"))
+        .and_then(|h| h.parse().map_err(Into::into))?;
+    let m: f64 = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No minutes in time: {}, s"))
+        .and_then(|m| m.parse().map_err(Into::into))?;
+
+    Ok(h + (m / 60.0))
+}
+
+fn parse_settings(info: &str) -> anyhow::Result<PlateSettings> {
+    let info = info.split('\t').map(str::trim).collect::<Vec<_>>();
+
+    // todo: probably less, check for < 12 first for initial info
+    // then check for more for specific things (F vs ABS, eg)
+    if info.len() < 31 {
+        anyhow::bail!(
+            "Less plate info entries than expected ({} < 31)",
+            info.len()
+        );
+    }
+
+    let name = info[1].to_string();
+    let read_type = info[4].to_string();
+    let read_mode = ReadMode::from_str(info[5])?;
+    let reads = info[9].parse()?;
+    let pattern = info[10].to_string();
+
+    // sub function based on read_mode
+    let waveno: usize = info[15].parse()?;
+    let ems = info[20].split_whitespace();
+    let exs = info[16].split_whitespace();
+    let wavelengths = ems
+        .zip(exs)
+        .take(waveno)
+        .map(|(em, ex)| {
+            em.parse()
+                .and_then(|em| ex.parse().map(|ex| Wavelength::Fluorescence(em, ex)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let wells = info[19].parse()?;
+    let rows = info[30].parse()?;
+    let cols = info[18].parse()?;
+
+    let settings = PlateSettings {
+        name,
+        rows,
+        cols,
+        wells,
+        wavelengths,
+        reads,
+        read_mode,
+        read_type,
+        pattern,
+    };
+
+    Ok(settings)
+}
+
+// TODO: platesettings {basic, read_info, plate_info}
+#[derive(Debug)]
+struct PlateSettings {
+    name: String,
+    rows: u8,
+    cols: u8,
+    wells: u32,
+    wavelengths: Vec<Wavelength>,
+    reads: u32, // timepoints, probably
+    read_mode: ReadMode,
+    read_type: String,
+    pattern: String,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ReadMode {
+    Fluorescence,
+    //Absorbance,
+}
+
+impl FromStr for ReadMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Fluorescence" => Ok(Self::Fluorescence),
+            //"Absorbance" => Ok(Self::Absorbance),
+            _ => Err(anyhow::anyhow!("Unknown read mode: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Wavelength {
+    Fluorescence(u16, u16), // ex, em
+                            //Absorbance(u16),
+}
+
+#[derive(Debug)]
+struct WellValue<'a> {
+    plate: &'a str,
+    temp: f64,
+    time: f64, // hours
+    wavelength: Wavelength,
+    well: (u8, u8), //r-c
+    value: f64,
+}
