@@ -1,5 +1,5 @@
 [package]
-name = "m5con"
+name = "m5conv"
 version = "0.1.0"
 authors = ["mwc10 <43445389+mwc10@users.noreply.github.com>"]
 edition = "2018"
