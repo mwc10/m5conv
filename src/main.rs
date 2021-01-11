@@ -5,49 +5,11 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::{env, str::FromStr};
+use noisy_float::prelude::*;
 
 mod m5;
+mod output;
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("{:?}", e);
-        ::std::process::exit(1);
-    }
-}
-
-fn run() -> anyhow::Result<()> {
-    let mut args = env::args().skip(1);
-    let input = args.next();
-    let output = args.next();
-
-    match input.as_deref() {
-        Some("-h") | Some("--help") => {
-            print_usage();
-            return Ok(());
-        }
-        None => {
-            eprintln!("Missing input M5 tab-delimited file");
-            eprintln!("Pass file path or --help for more info");
-            return Ok(());
-        }
-        Some(_) => (),
-    }
-
-    let input = PathBuf::from(input.unwrap());
-    let output = match output {
-        Some(p) => {
-            let f = File::create(PathBuf::from(p)).context("creating output file")?;
-            Box::new(BufWriter::new(f)) as Box<dyn Write>
-        }
-        None => Box::new(io::stdout()) as Box<dyn Write>,
-    };
-
-    parse_input(input, output)
-
-    //println!("{:?}", data);
-
-    //Ok(())
-}
 
 fn print_usage() {
     println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
@@ -60,49 +22,56 @@ fn print_usage() {
     println!("  [output]        path to output, or stdout if not present");
 }
 
-#[derive(Debug)]
-struct M5Data {
-    blocks: u16,
+enum Args {
+    Help,
+    Missing,
+    Convert(PathBuf, Box<dyn Write>),
 }
 
-fn write_data(data: Vec<WellValue>, wtr: Box<dyn Write>) -> anyhow::Result<()> {
-    let mut wtr = csv::Writer::from_writer(wtr);
-    let header = [
-        "Plate",
-        "Well",
-        "Row",
-        "Col",
-        "Time [hr]",
-        "Temperature [C]",
-        "Read Mode",
-        "Wavelength",
-        "Value",
-    ];
-    wtr.write_record(&header)
-        .context("writing output CSV header")?;
+impl Args {
+    fn from_env() -> anyhow::Result<Self> {
+        let mut args = env::args().skip(1);
+        let input = args.next();
+        let output = args.next();
 
-    for well in data {
-        wtr.write_field(well.plate)?;
-        let row_char = (b'A' + well.well.0) as char;
-        wtr.write_field(format!("{}{:02}", row_char, well.well.1 + 1))?;
-        wtr.write_field(&[row_char as u8])?;
-        wtr.write_field(format!("{}", well.well.1))?;
-        wtr.write_field(format!("{}", well.time))?;
-        wtr.write_field(format!("{}", well.temp))?;
-        match well.wavelength {
-            Wavelength::Fluorescence(ex, em) => {
-                wtr.write_field("Fluorescence")?;
-                wtr.write_field(format!("ex {}/em {}", ex, em))?;
-            }
-            _ => {
-                bail!("unsupported wavelength for output: {:?}", well.wavelength);
+        match input {
+            Some(s) if s == "-h" || s == "--help" => Ok(Self::Help),
+            None => Ok(Self::Missing),
+            Some(p) => {
+                let input = PathBuf::from(p);
+                let output = match output {
+                    Some(p) => {
+                        let f = File::create(PathBuf::from(p)).context("creating output file")?;
+                        Box::new(BufWriter::new(f)) as Box<dyn Write>
+                    }
+                    None => Box::new(io::stdout()) as Box<dyn Write>,
+                };
+                Ok(Self::Convert(input, output))
             }
         }
-        wtr.write_field(format!("{}", well.value))?;
-        wtr.write_record(None::<&[u8]>)?;
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::from_env().context("parsing args")?;
+
+    match args {
+        Args::Help => print_usage(),
+        Args::Missing => {
+            eprintln!("Missing input M5 tab-delimited file");
+            eprintln!("Pass --help for more info");
+        },
+        Args::Convert(input, output) => {
+            parse_input(input, output)?;
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct M5Data {
+    blocks: u16,
 }
 
 fn parse_input<'a>(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> {
@@ -135,7 +104,8 @@ fn parse_input<'a>(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> 
 
     let plate_data = parse_plate(&mut rdr, &mut buf, &settings)?;
 
-    write_data(plate_data, output).context("writing output CSV")
+    //write_data(plate_data, output).context("writing output CSV")
+    output::write_data(plate_data, output).context("writing output CSV")
 }
 
 fn parse_plate<'p, R: BufRead>(
@@ -231,15 +201,15 @@ fn check_spacer(s: &str) -> anyhow::Result<()> {
     }
 }
 
-fn get_temp(s: &str) -> anyhow::Result<Option<f64>> {
+fn get_temp(s: &str) -> anyhow::Result<Option<R64>> {
     if s.is_empty() {
         Ok(None)
     } else {
-        Some(s.parse().map_err(Into::into)).transpose()
+        Some(s.parse::<f64>().map(r64).map_err(Into::into)).transpose()
     }
 }
 
-fn get_time(s: &str) -> anyhow::Result<Option<f64>> {
+fn get_time(s: &str) -> anyhow::Result<Option<R64>> {
     if s.is_empty() {
         Ok(None)
     } else {
@@ -247,7 +217,7 @@ fn get_time(s: &str) -> anyhow::Result<Option<f64>> {
     }
 }
 
-fn parse_time(s: &str) -> anyhow::Result<f64> {
+fn parse_time(s: &str) -> anyhow::Result<R64> {
     let mut it = s.splitn(2, ':');
     let h: f64 = it
         .next()
@@ -258,7 +228,7 @@ fn parse_time(s: &str) -> anyhow::Result<f64> {
         .ok_or_else(|| anyhow::anyhow!("No minutes in time: {}, s"))
         .and_then(|m| m.parse().map_err(Into::into))?;
 
-    Ok(h + (m / 60.0))
+    Ok(r64(h + (m / 60.0)))
 }
 
 fn parse_settings(info: &str) -> anyhow::Result<PlateSettings> {
@@ -343,18 +313,29 @@ impl FromStr for ReadMode {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 enum Wavelength {
     Fluorescence(u16, u16), // ex, em
                             //Absorbance(u16),
 }
 
+impl Wavelength {
+    fn as_strings(&self) -> (&'static str, String) {
+        match self {
+            Self::Fluorescence(ex, em) => ("Fluorescence", format!("ex {}/em {}", ex, em))
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WellValue<'a> {
     plate: &'a str,
-    temp: f64,
-    time: f64, // hours
+    /// for now, only deg. Celcius
+    temp: R64,
+    /// hours
+    time: R64,
     wavelength: Wavelength,
-    well: (u8, u8), //r-c
+    /// zero-indexed (row, col)
+    well: (u8, u8),
     value: f64,
 }
