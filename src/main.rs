@@ -1,11 +1,9 @@
-use anyhow::{self, bail, Context};
+use anyhow::{self, Context};
 use encoding_rs::MACINTOSH;
 use encoding_rs_io::DecodeReaderBytesBuilder;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::{env, str::FromStr};
-use noisy_float::prelude::*;
 
 mod m5;
 mod output;
@@ -30,7 +28,7 @@ enum Args {
 
 impl Args {
     fn from_env() -> anyhow::Result<Self> {
-        let mut args = env::args().skip(1);
+        let mut args = std::env::args().skip(1);
         let input = args.next();
         let output = args.next();
 
@@ -69,11 +67,20 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct M5Data {
-    blocks: u16,
+
+fn parse_input(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> {
+    // output text file seems to be in macroman encoding..? Just for the degree symbol...
+    let decoder = DecodeReaderBytesBuilder::new()
+        .encoding(Some(MACINTOSH))
+        .build(File::open(path)?);
+    let rdr = BufReader::new(decoder);
+
+    let file = m5::M5File::read_and_parse(rdr)?;
+
+    output::write_csv(file, output).context("writing to output csv")
 }
 
+/*
 fn parse_input<'a>(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> {
     // output text file seems to be in macroman encoding..? Just for the degree symbol...
     let decoder = DecodeReaderBytesBuilder::new()
@@ -83,7 +90,7 @@ fn parse_input<'a>(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> 
     let mut buf = String::with_capacity(0x100);
 
     rdr.read_line(&mut buf).context("reading block count")?;
-    let block_count = m5::M5DataBlocks::from_str(&buf).context("parsing initial blocks count")?;
+    let block_count = m5::M5BlockCount::from_str(&buf).context("parsing initial blocks count")?;
     //println!("{:?}", block_count);
     buf.clear();
 
@@ -295,37 +302,7 @@ struct PlateSettings {
     pattern: String,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum ReadMode {
-    Fluorescence,
-    //Absorbance,
-}
 
-impl FromStr for ReadMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "Fluorescence" => Ok(Self::Fluorescence),
-            //"Absorbance" => Ok(Self::Absorbance),
-            _ => Err(anyhow::anyhow!("Unknown read mode: {}", s)),
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-enum Wavelength {
-    Fluorescence(u16, u16), // ex, em
-                            //Absorbance(u16),
-}
-
-impl Wavelength {
-    fn as_strings(&self) -> (&'static str, String) {
-        match self {
-            Self::Fluorescence(ex, em) => ("Fluorescence", format!("ex {}/em {}", ex, em))
-        }
-    }
-}
 
 #[derive(Debug)]
 struct WellValue<'a> {
@@ -339,3 +316,4 @@ struct WellValue<'a> {
     well: (u8, u8),
     value: f64,
 }
+*/
