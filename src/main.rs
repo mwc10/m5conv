@@ -8,7 +8,6 @@ use std::path::PathBuf;
 mod m5;
 mod output;
 
-
 fn print_usage() {
     println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
     println!("Convert Softmax M5(e) tab-delimited to flat CSV by well");
@@ -58,7 +57,7 @@ fn main() -> anyhow::Result<()> {
         Args::Missing => {
             eprintln!("Missing input M5 tab-delimited file");
             eprintln!("Pass --help for more info");
-        },
+        }
         Args::Convert(input, output) => {
             parse_input(input, output)?;
         }
@@ -66,7 +65,6 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 fn parse_input(path: PathBuf, output: Box<dyn Write>) -> anyhow::Result<()> {
     // output text file seems to be in macroman encoding..? Just for the degree symbol...

@@ -1,9 +1,7 @@
 use std::{io::BufRead, str::FromStr};
 
-use anyhow::{Result, Error, Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use noisy_float::prelude::*;
-
-
 
 #[derive(Debug)]
 pub(crate) struct M5File(pub(crate) Vec<PlateBlock>);
@@ -14,12 +12,14 @@ impl M5File {
 
         rdr.read_line(&mut buf).context("reading block count")?;
         let block_count = get_block_count(&buf).context("parsing initial blocks count")?;
-        println!("Total Blocks: {:?}", block_count);
         buf.clear();
 
         (0..block_count)
-            .map(|i| PlateBlock::from_rdr(&mut rdr, &mut buf).with_context(|| anyhow!("parsing block {}", i)))
-            .collect::<Result<_,_>>()
+            .map(|i| {
+                PlateBlock::from_rdr(&mut rdr, &mut buf)
+                    .with_context(|| anyhow!("parsing block {}", i))
+            })
+            .collect::<Result<_, _>>()
             .map(Self)
     }
 }
@@ -31,7 +31,7 @@ pub(crate) struct PlateBlock {
 }
 
 impl PlateBlock {
-    pub(crate) fn from_rdr(mut rdr: &mut dyn BufRead, buf: &mut String) -> Result<Self> {
+    fn from_rdr(mut rdr: &mut dyn BufRead, buf: &mut String) -> Result<Self> {
         // read and parse plate settings row
         rdr.read_line(buf).context("reading plate info row")?;
         let settings = PlateSettings::parse(buf).context("parsing plate info")?;
@@ -39,7 +39,7 @@ impl PlateBlock {
         // read time / temp / col headers line
         // TODO: more validation of this row? The first column seems to change based on ReadType
         rdr.read_line(buf)
-        .context("reading temp. and plate col header line")?;
+            .context("reading temp. and plate col header line")?;
         match buf.split('\t').nth(1) {
             Some("Temperature(°C)") => (),
             Some(unk) => bail!("Unknown/unsupported temperature unit: {}", unk),
@@ -50,7 +50,8 @@ impl PlateBlock {
         // read each single read of a plate
         let mut data = Vec::with_capacity(settings.info.reads);
         for i in 0..settings.info.reads {
-            let read_output = parse_plate(&mut rdr, buf, &settings).with_context(|| anyhow!("parsing plate {}", i))?;
+            let read_output = parse_plate(&mut rdr, buf, &settings)
+                .with_context(|| anyhow!("parsing plate {}", i))?;
             data.push(read_output)
         }
         buf.clear();
@@ -61,7 +62,7 @@ impl PlateBlock {
         }
         buf.clear();
 
-        Ok(Self { settings, data})
+        Ok(Self { settings, data })
     }
 }
 
@@ -87,7 +88,12 @@ impl PlateSettings {
         let unique_data = &info[6..];
         let info = PlateInfo::from_text(read_type, read_mode, unique_data)?;
 
-        Ok(Self { name, read_type, read_mode, info})
+        Ok(Self {
+            name,
+            read_type,
+            read_mode,
+            info,
+        })
     }
 }
 
@@ -113,15 +119,28 @@ impl PlateInfo {
                 let col_end = keys[11].parse()?;
                 let plate_size = keys[12].parse()?;
                 let wave_no = keys[8].parse()?;
-                let wavelengths = keys[9].split_whitespace()
+                let wavelengths = keys[9]
+                    .split_whitespace()
                     .take(wave_no)
                     .map(|s| s.parse().map(Wavelength::Absorbance))
-                    .collect::<Result<_,_>>()?;
+                    .collect::<Result<_, _>>()?;
 
-                Self {plate_size, row_start, row_end, col_start, col_end, reads, wavelengths}
+                Self {
+                    plate_size,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                    reads,
+                    wavelengths,
+                }
             }
 
-            _ => bail!("Unsupported read type and mode {:?} {:?}", read_type, read_mode),
+            _ => bail!(
+                "Unsupported read type and mode {:?} {:?}",
+                read_type,
+                read_mode
+            ),
         };
 
         Ok(info)
@@ -134,7 +153,6 @@ impl PlateInfo {
         rows * cols * self.wavelengths.len()
     }
 }
-
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ReadType {
@@ -187,7 +205,14 @@ impl ReadInfo {
 
         let temp = c2.parse().map(r64).context("parsing time value")?;
 
-        Ok(Self{temp, unique})
+        Ok(Self { temp, unique })
+    }
+
+    pub(crate) fn get_time(&self) -> Option<R64> {
+        match self.unique {
+            UniqueReadInfo::None => None,
+            UniqueReadInfo::WellScan { time } => Some(time),
+        }
     }
 }
 
@@ -196,7 +221,6 @@ pub(crate) enum UniqueReadInfo {
     None,
     WellScan { time: R64 },
 }
-
 
 pub type WellRC = (u8, u8);
 #[derive(Debug)]
@@ -213,30 +237,29 @@ pub(crate) enum Wavelength {
     Absorbance(u16),
 }
 
-impl Wavelength {
-    pub(crate) fn as_strings(&self) -> (&'static str, String) {
-        match self {
-            Self::Fluorescence(ex, em) => ("Fluorescence", format!("ex {}/em {}", ex, em)),
-            Self::Absorbance(abs) => ("Absorbance", format!("{}", abs)),
-        }
-    }
-}
-
 fn get_block_count(s: &str) -> Result<u16> {
     let mut it = s.split_whitespace().take(2);
 
     match (it.next(), it.next()) {
         (Some("##BLOCKS="), Some(b)) => Ok(b),
         _ => Err(anyhow!("Missing BLOCKS magic string")),
-    }.and_then(|b| b.parse().map_err(Into::into))
+    }
+    .and_then(|b| b.parse().map_err(Into::into))
 }
 
-fn parse_plate(rdr: &mut dyn BufRead, buf: &mut String, settings: &PlateSettings) -> Result<(ReadInfo, Vec<WellValue>)> {
+fn parse_plate(
+    rdr: &mut dyn BufRead,
+    buf: &mut String,
+    settings: &PlateSettings,
+) -> Result<(ReadInfo, Vec<WellValue>)> {
     let total_wells = settings.info.total_wells_read();
     let mut output = Vec::with_capacity(total_wells);
     let (total_rows, total_cols) = match settings.info.plate_size {
         384 => Ok((16, 24)),
-        _ => Err(anyhow!("Unsupported plate size {} TODO: use col header to calc?", settings.info.plate_size))
+        _ => Err(anyhow!(
+            "Unsupported plate size {} TODO: use col header to calc?",
+            settings.info.plate_size
+        )),
     }?;
 
     let mut read_info = None;
@@ -247,8 +270,12 @@ fn parse_plate(rdr: &mut dyn BufRead, buf: &mut String, settings: &PlateSettings
 
         let mut line = buf.split('\t');
 
-        let c1 = line.next().ok_or_else(|| anyhow!("expected info col 1: {}", buf))?;
-        let c2 = line.next().ok_or_else(|| anyhow!("expected info col 2: {}", buf))?;
+        let c1 = line
+            .next()
+            .ok_or_else(|| anyhow!("expected info col 1: {}", buf))?;
+        let c2 = line
+            .next()
+            .ok_or_else(|| anyhow!("expected info col 2: {}", buf))?;
         if read_info.is_none() {
             read_info = Some(ReadInfo::parse_cols(c1, c2, settings.read_type)?);
         }
@@ -262,10 +289,21 @@ fn parse_plate(rdr: &mut dyn BufRead, buf: &mut String, settings: &PlateSettings
             .flat_map(|(values, wavelength)| {
                 let (values, _spacer) = values.split_at(total_cols);
 
-                values.iter().copied().map(str::trim).enumerate()
+                values
+                    .iter()
+                    .copied()
+                    .map(str::trim)
+                    .enumerate()
                     .filter(|(_, s)| !s.is_empty())
                     .map(move |(c, value)| {
-                        value.parse().context("parsing well value").map(|value| WellValue {wavelength, value, well: (r, c as u8)})
+                        value
+                            .parse()
+                            .context("parsing well value")
+                            .map(|value| WellValue {
+                                wavelength,
+                                value,
+                                well: (r, c as u8),
+                            })
                     })
             });
 
