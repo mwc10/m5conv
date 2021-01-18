@@ -336,23 +336,7 @@ fn parse_plate(
             .zip(settings.info.wavelengths.iter().copied())
             .flat_map(|(values, wavelength)| {
                 let (values, _spacer) = values.split_at(total_cols);
-
-                values
-                    .iter()
-                    .copied()
-                    .map(str::trim)
-                    .enumerate()
-                    .filter(|(_, s)| !s.is_empty())
-                    .map(move |(c, value)| {
-                        value
-                            .parse()
-                            .context("parsing well value")
-                            .map(|value| WellValue {
-                                wavelength,
-                                value,
-                                well: (r, c as u8),
-                            })
-                    })
+                parse_row_values(values, r, wavelength)
             });
 
         for val in values {
@@ -368,4 +352,27 @@ fn parse_plate(
     let read_info = read_info.ok_or_else(|| anyhow!("never found read info"))?;
 
     Ok((read_info, output))
+}
+
+fn parse_row_values<'a>(
+    values: &'a [&str],
+    r: u8,
+    wavelength: Wavelength,
+) -> impl Iterator<Item = Result<WellValue>> + 'a {
+    values
+        .iter()
+        .copied()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(move |(c, value)| {
+            value
+                .parse()
+                .context("parsing well value")
+                .map(|value| WellValue {
+                    wavelength,
+                    value,
+                    well: (r, c as u8),
+                })
+        })
 }
