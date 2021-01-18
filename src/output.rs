@@ -25,9 +25,10 @@ pub(crate) fn write_csv(file: M5File, wtr: Box<dyn Write>) -> Result<()> {
     wtr.write_record(HEADER)
         .context("writing output CSV header")?;
 
-    file.0.into_iter().try_for_each(|block| {
-        write_block(block, &mut wtr, &mut cache).context("writing plate block")
-    })
+    file.0
+        .into_iter()
+        .try_for_each(|block| write_block(block, &mut wtr, &mut cache))
+        .context("writing CSV data")
 }
 
 #[derive(Debug)]

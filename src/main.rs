@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 mod m5;
 mod output;
+mod utils;
 
 fn print_usage() {
     println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));

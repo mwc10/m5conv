@@ -1,5 +1,6 @@
 use std::{io::BufRead, str::FromStr};
 
+use crate::utils::rmap2;
 use anyhow::{anyhow, bail, Context, Error, Result};
 use noisy_float::prelude::*;
 
@@ -17,7 +18,7 @@ impl M5File {
         (0..block_count)
             .map(|i| {
                 PlateBlock::from_rdr(&mut rdr, &mut buf)
-                    .with_context(|| anyhow!("parsing block {}", i))
+                    .with_context(|| anyhow!("parsing block {}", i + 1))
             })
             .collect::<Result<_, _>>()
             .map(Self)
@@ -51,7 +52,7 @@ impl PlateBlock {
         let mut data = Vec::with_capacity(settings.info.reads);
         for i in 0..settings.info.reads {
             let read_output = parse_plate(&mut rdr, buf, &settings)
-                .with_context(|| anyhow!("parsing plate {}", i))?;
+                .with_context(|| anyhow!("parsing plate read {}", i + 1))?;
             data.push(read_output)
         }
         buf.clear();
@@ -86,7 +87,8 @@ impl PlateSettings {
         let read_type = ReadType::from_str(info[4])?;
         let read_mode = ReadMode::from_str(info[5])?;
         let unique_data = &info[6..];
-        let info = PlateInfo::from_text(read_type, read_mode, unique_data)?;
+        let info = PlateInfo::from_text(read_type, read_mode, unique_data)
+            .with_context(|| anyhow!("bad info? {:#?}", unique_data))?;
 
         Ok(Self {
             name,
@@ -101,9 +103,9 @@ impl PlateSettings {
 struct PlateInfo {
     plate_size: u32,
     row_start: u8,
-    row_end: u8,
+    row_span: u8,
     col_start: u8,
-    col_end: u8,
+    col_span: u8,
     reads: usize,
     wavelengths: Vec<Wavelength>,
 }
@@ -114,9 +116,9 @@ impl PlateInfo {
             (ReadType::Endpoint, ReadMode::Absorbance) => {
                 let reads = keys[2].parse()?;
                 let row_start = keys[13].parse()?;
-                let row_end = keys[14].parse()?;
+                let row_span = keys[14].parse()?;
                 let col_start = keys[10].parse()?;
-                let col_end = keys[11].parse()?;
+                let col_span = keys[11].parse()?;
                 let plate_size = keys[12].parse()?;
                 let wave_no = keys[8].parse()?;
                 let wavelengths = keys[9]
@@ -128,16 +130,43 @@ impl PlateInfo {
                 Self {
                     plate_size,
                     row_start,
-                    row_end,
+                    row_span,
                     col_start,
-                    col_end,
+                    col_span,
                     reads,
                     wavelengths,
                 }
             }
+            (ReadType::Endpoint, ReadMode::Fluorescence)
+            | (ReadType::WellScan, ReadMode::Fluorescence) => {
+                let reads = keys[3].parse().context("read no")?;
+                let row_start = keys[23].parse().context("row start")?;
+                let row_span = keys[24].parse().context("row span")?;
+                let col_start = keys[11].parse().context("col start")?;
+                let col_span = keys[12].parse().context("col span")?;
+                let plate_size = keys[13].parse().context("plate size")?;
+                let wave_no = keys[9].parse().context("wave no")?;
+                let exs = keys[14].split_whitespace();
+                let ems = keys[10].split_whitespace();
+                let wavelengths = exs
+                    .zip(ems)
+                    .take(wave_no)
+                    .map(|(ex, em)| rmap2(ex.parse(), em.parse(), Wavelength::Fluorescence))
+                    .collect::<Result<_, _>>()
+                    .context("parsing ex/em wavelengths")?;
 
+                Self {
+                    plate_size,
+                    row_start,
+                    row_span,
+                    col_start,
+                    col_span,
+                    reads,
+                    wavelengths,
+                }
+            }
             _ => bail!(
-                "Unsupported read type and mode {:?} {:?}",
+                "Unsupported read type and read mode combination: {:?} {:?}",
                 read_type,
                 read_mode
             ),
@@ -147,10 +176,7 @@ impl PlateInfo {
     }
 
     fn total_wells_read(&self) -> usize {
-        let rows = (self.row_end - self.row_start + 1) as usize;
-        let cols = (self.col_end - self.col_start + 1) as usize;
-
-        rows * cols * self.wavelengths.len()
+        self.row_span as usize * self.col_span as usize * self.wavelengths.len()
     }
 }
 
@@ -167,7 +193,7 @@ impl FromStr for ReadType {
         match s {
             "Well Scan" => Ok(Self::WellScan),
             "Endpoint" => Ok(Self::Endpoint),
-            _ => Err(anyhow!("Unknown M5 read type: {}", s)),
+            _ => Err(anyhow!("Unsupported M5 read type: {}", s)),
         }
     }
 }
@@ -185,7 +211,7 @@ impl FromStr for ReadMode {
         match s {
             "Fluorescence" => Ok(Self::Fluorescence),
             "Absorbance" => Ok(Self::Absorbance),
-            _ => Err(anyhow::anyhow!("Unknown read mode: {}", s)),
+            _ => Err(anyhow::anyhow!("Unsupported read mode: {}", s)),
         }
     }
 }
@@ -200,10 +226,13 @@ impl ReadInfo {
     fn parse_cols(c1: &str, c2: &str, rtype: ReadType) -> Result<Self> {
         let unique = match rtype {
             ReadType::Endpoint => UniqueReadInfo::None,
-            ReadType::WellScan => todo!(),
+            ReadType::WellScan => {
+                let time = parse_time(c1).context("parsing time column")?;
+                UniqueReadInfo::Time(time)
+            }
         };
 
-        let temp = c2.parse().map(r64).context("parsing time value")?;
+        let temp = c2.parse().map(r64).context("parsing temperature value")?;
 
         Ok(Self { temp, unique })
     }
@@ -211,7 +240,7 @@ impl ReadInfo {
     pub(crate) fn get_time(&self) -> Option<R64> {
         match self.unique {
             UniqueReadInfo::None => None,
-            UniqueReadInfo::WellScan { time } => Some(time),
+            UniqueReadInfo::Time(time) => Some(time),
         }
     }
 }
@@ -219,7 +248,7 @@ impl ReadInfo {
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum UniqueReadInfo {
     None,
-    WellScan { time: R64 },
+    Time(R64),
 }
 
 pub type WellRC = (u8, u8);
@@ -247,6 +276,24 @@ fn get_block_count(s: &str) -> Result<u16> {
     .and_then(|b| b.parse().map_err(Into::into))
 }
 
+fn parse_time(s: &str) -> Result<R64> {
+    let mut it = s.splitn(3, ':');
+    let h: f64 = it
+        .next()
+        .ok_or_else(|| anyhow!("No hours in time: {}, s"))
+        .and_then(|h| h.parse().map_err(Into::into))?;
+    let m: f64 = it
+        .next()
+        .ok_or_else(|| anyhow!("No minutes in time: {}, s"))
+        .and_then(|m| m.parse().map_err(Into::into))?;
+    let s: f64 = it
+        .next()
+        .map_or(Ok(0.0), |s| s.parse())
+        .context("couldn't parse seconds")?;
+
+    Ok(r64(h + (m / 60.0) + (s / (60.0 * 60.0))))
+}
+
 fn parse_plate(
     rdr: &mut dyn BufRead,
     buf: &mut String,
@@ -256,8 +303,9 @@ fn parse_plate(
     let mut output = Vec::with_capacity(total_wells);
     let (total_rows, total_cols) = match settings.info.plate_size {
         384 => Ok((16, 24)),
+        96 => Ok((8, 12)),
         _ => Err(anyhow!(
-            "Unsupported plate size {} TODO: use col header to calc?",
+            "Unsupported plate size {}",
             settings.info.plate_size
         )),
     }?;
